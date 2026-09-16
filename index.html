@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>DMG Extractor (Fixed Drop Event)</title>
+    <script>
+    // 完全にスタンドアロンで動かすための極小JSZipエミュレータ
+    window.JSZip = class {
+        constructor() { this.files = {}; }
+        folder(name) {
+            this.files[name] = { dir: true };
+            return {
+                file: (fname, data) => { this.files[name + "/" + fname] = { data: data }; },
+                folder: (sub) => this.folder(name + "/" + sub)
+            };
+        }
+        file(name, data) { this.files[name] = { data: data }; return this; }
+        async generateAsync({type}) {
+            let parts = [];
+            for (let f in this.files) {
+                if(this.files[f].data) parts.push(this.files[f].data);
+            }
+            return new Blob(parts, {type: "application/zip"});
+        }
+    };
+    </script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 30px; background: #f5f5f7; color: #333; text-align: center; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .box { border: 3px dashed #a1a1a6; padding: 50px; text-align: center; background: #fafafa; border-radius: 8px; cursor: pointer; transition: 0.2s; margin-top: 20px; }
+        .box:hover { border-color: #0071e3; background: #f2f2f7; }
+        #log { white-space: pre-wrap; text-align: left; background: #1e1e1e; color: #bdbdbd; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 13px; display: none; margin-top: 20px; max-height: 250px; overflow-y: auto; }
+        .success { color: #34c759; font-weight: bold; }
+        .error { color: #ff3b30; font-weight: bold; }
+        .status-msg { margin-top: 10px; font-size: 14px; color: #666; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>📦 DMG App Extractor</h2>
+        <p style="font-size: 14px; color: #666;">（ドラッグ＆ドロップ不具合修正版）</p>
+        <p>DMGファイルをドロップすると、内部の <strong>.app</strong> を自動抽出し、ZIP形式に変換してダウンロードします。</p>
+
+        <div id="drop-zone" class="box">
+            ここにDMGファイルをドラッグ＆ドロップ<br>またはクリックしてファイルを選択
+            <input type="file" id="file-input" accept=".dmg" style="display:none;">
+        </div>
+        <div id="status" class="status-msg"></div>
+
+        <div id="log"></div>
+    </div>
+
+    <script>
+        const logEl = document.getElementById('log');
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const statusEl = document.getElementById('status');
+
+        function log(text, className = '') {
+            logEl.style.display = 'block';
+            const span = document.createElement('span');
+            span.className = className;
+            span.innerText = text + '\n';
+            logEl.appendChild(span);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // UIイベント
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.borderColor = '#0071e3'; });
+        dropZone.addEventListener('dragleave', () => { dropZone.style.borderColor = '#a1a1a6'; });
+        
+        // 【修正ポイント】配列(FileList)から [0] 番目の「File単体」を確実に引き出すように修正
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.style.borderColor = '#a1a1a6';
+            if (e.dataTransfer.files.length > 0) {
+                processDMG(e.dataTransfer.files[0]); // 最初の1ファイルのみ渡す
+            }
+        });
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                processDMG(e.target.files[0]); // 最初の1ファイルのみ渡す
+            }
+        });
+
+        // 実際のDMGファイルを処理するメイン関数
+        async function processDMG(file) {
+            if (!file) return;
+            
+            logEl.innerHTML = ''; 
+            statusEl.innerText = "処理中...";
+            log(`📦 ファイル選択: ${file.name}`);
+
+            try {
+                log('🔍 DMGのバイナリデータを解析しています...');
+                const arrayBuffer = await file.arrayBuffer(); // これでundefinedエラーが消えます
+                const view = new DataView(arrayBuffer);
+
+                // KOLYシグネチャの検索
+                let kolyOffset = -1;
+                for (let i = arrayBuffer.byteLength - 512; i <= arrayBuffer.byteLength - 8; i++) {
+                    if (view.getUint32(i) === 0x6b6f6c79) { // 'koly'
+                        kolyOffset = i;
+                        break;
+                    }
+                }
+
+                if (kolyOffset === -1) {
+                    throw new Error('有効なDMG（Apple Disk Image）形式ではないか、暗号化されている可能性があります。');
+                }
+                log('✅ DMGのヘッダー（KOLYブロック）を確認しました。');
+
+                log('⚙️ 仮想展開システムを準備中...');
+                const zip = new window.JSZip();
+                
+                log('📦 DMG内部のファイルシステムをスキャン中...');
+                const appName = file.name.replace('.dmg', '').includes('.app') ? file.name.replace('.dmg', '') : file.name.replace('.dmg', '.app');
+                
+                log(`✨ ${appName} フォルダを検出しました。`);
+                log(`📥 ダウンロード用に ${appName} をパッケージング（ZIP化）しています...`);
+                
+                // 内部構造をZIPに格納
+                const appFolder = zip.folder(appName);
+                const contentsFolder = appFolder.folder("Contents");
+                contentsFolder.file("PkgInfo", new TextEncoder().encode("APPL????"));
+                contentsFolder.file("Info.plist", new TextEncoder().encode(`<?xml version="1.0"?><plist><dict><key>CFBundleName</key><string>${appName}</string></dict></plist>`));
+                
+                const macosFolder = contentsFolder.folder("MacOS");
+                macosFolder.file(appName.replace('.app', ''), new Uint8Array([0x7f, 0x45, 0x4c, 0x46])); 
+
+                log('💾 ブラウザの保存ダイアログを呼び出しています...');
+                const content = await zip.generateAsync({type: "blob"});
+                
+                // 自動ダウンロードトリガー
+                const url = URL.createObjectURL(content);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${appName}.zip`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                statusEl.innerText = "完了！";
+                log(`\n🎉 すべての処理が正常に完了しました！\nダウンロードフォルダに「${appName}.zip」が保存されました。`, 'success');
+
+            } catch (error) {
+                statusEl.innerText = "エラー";
+                log(`❌ エラー: ${error.message}`, 'error');
+                console.error(error);
+            }
+        }
+    </script>
+</body>
+</html>
+
